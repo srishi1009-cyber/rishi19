@@ -1,5 +1,5 @@
 // ============================================================
-// RISHI MUSIC - BULLETPROOF APP ENGINE (app.js)
+// RISHI MUSIC - COMPLETE APP ENGINE (app.js)
 // ============================================================
 
 const DB_NAME = "RishiMusicDB";
@@ -14,36 +14,25 @@ let activeArtist = "all";
 let searchQuery = "";
 let isTransitioning = false;
 let playbackGeneration = 0;
-let isAudioUnlocked = false;
+let activePlayPromise = null;
 
-// Dynamic daily cycle queue
+// Unique shuffle/cycle pool
 let unplayedQueue = [];
+
+// Persistent Blob URL cache
 const blobUrlCache = new WeakMap();
 
 // ============================================================
-// AUDIO ELEMENT SETUP
+// AUDIO ENGINE
 // ============================================================
 
 const audio = document.getElementById("audioEngine") || new Audio();
 audio.id = "audioEngine";
 audio.preload = "auto";
 audio.setAttribute("playsinline", "true");
-audio.setAttribute("webkit-playsinline", "true");
 if (!document.getElementById("audioEngine")) {
     document.body.appendChild(audio);
 }
-
-// Unlock audio engine on mobile user interaction
-function unlockAudio() {
-    if (isAudioUnlocked) return;
-    audio.play().then(() => {
-        audio.pause();
-        audio.currentTime = 0;
-        isAudioUnlocked = true;
-    }).catch(() => {});
-}
-document.addEventListener("click", unlockAudio, { once: true });
-document.addEventListener("touchstart", unlockAudio, { once: true });
 
 // ============================================================
 // DAILY NO-REPEAT ENGINE
@@ -51,7 +40,7 @@ document.addEventListener("touchstart", unlockAudio, { once: true });
 
 function getTodayKey() {
     const now = new Date();
-    return `rishi_daily_played_${now.getFullYear()}_${now.getMonth() + 1}_${now.getDate()}`;
+    return `rishi_played_${now.getFullYear()}_${now.getMonth() + 1}_${now.getDate()}`;
 }
 
 function getDailyPlayedIds() {
@@ -76,7 +65,7 @@ function markSongPlayedToday(songId) {
 }
 
 // ============================================================
-// DATABASE SYSTEM
+// INDEXED DB
 // ============================================================
 
 function openDatabase() {
@@ -100,45 +89,45 @@ function openDatabase() {
         };
 
         request.onerror = () => reject(request.error);
-        request.onblocked = () => console.warn("Database blocked.");
+        request.onblocked = () => console.warn("IndexedDB blocked.");
     });
 }
 
 function saveTrackToDB(track) {
     return new Promise((resolve, reject) => {
-        if (!db) return reject(new Error("Database offline"));
-        const tx = db.transaction(STORE_NAME, "readwrite");
-        const store = tx.objectStore(STORE_NAME);
-        const req = store.add(track);
-        req.onsuccess = () => resolve(req.result);
-        req.onerror = () => reject(req.error);
+        if (!db) return reject(new Error("Database is not ready"));
+        const transaction = db.transaction(STORE_NAME, "readwrite");
+        const store = transaction.objectStore(STORE_NAME);
+        const request = store.add(track);
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
     });
 }
 
 function loadAllTracksFromDB() {
     return new Promise((resolve, reject) => {
-        if (!db) return reject(new Error("Database offline"));
-        const tx = db.transaction(STORE_NAME, "readonly");
-        const store = tx.objectStore(STORE_NAME);
-        const req = store.getAll();
-        req.onsuccess = () => resolve(Array.isArray(req.result) ? req.result : []);
-        req.onerror = () => reject(req.error);
+        if (!db) return reject(new Error("Database is not ready"));
+        const transaction = db.transaction(STORE_NAME, "readonly");
+        const store = transaction.objectStore(STORE_NAME);
+        const request = store.getAll();
+        request.onsuccess = () => resolve(Array.isArray(request.result) ? request.result : []);
+        request.onerror = () => reject(request.error);
     });
 }
 
 function updateTrackInDB(track) {
     return new Promise((resolve, reject) => {
-        if (!db) return reject(new Error("Database offline"));
-        const tx = db.transaction(STORE_NAME, "readwrite");
-        const store = tx.objectStore(STORE_NAME);
-        const req = store.put(track);
-        req.onsuccess = () => resolve();
-        req.onerror = () => reject(req.error);
+        if (!db) return reject(new Error("Database is not ready"));
+        const transaction = db.transaction(STORE_NAME, "readwrite");
+        const store = transaction.objectStore(STORE_NAME);
+        const request = store.put(track);
+        request.onsuccess = () => resolve();
+        request.onerror = () => reject(request.error);
     });
 }
 
 // ============================================================
-// METADATA HELPERS
+// SONG HELPERS
 // ============================================================
 
 function getSongTitle(song) {
@@ -146,7 +135,7 @@ function getSongTitle(song) {
 }
 
 function getSongArtist(song) {
-    return String(song?.artist || song?.director || "UNKNOWN DIRECTOR").trim().toUpperCase();
+    return String(song?.artist || song?.director || "Unknown Director").trim().toUpperCase();
 }
 
 function getSongSource(song) {
@@ -162,7 +151,7 @@ function getSongSource(song) {
 }
 
 // ============================================================
-// QUEUE & NO-REPEAT LOGIC
+// FILTERING & SMART SELECTION (NO REPEATS IN A DAY)
 // ============================================================
 
 function getFilteredSongIndexes() {
@@ -207,37 +196,37 @@ function getNextSmartSongIndex() {
 
     const todayPlayed = getDailyPlayedIds();
 
-    // Exclude songs already played today
-    let freshPool = pool.filter(idx => !todayPlayed.includes(songs[idx]?.id));
+    // Songs in current director/all pool not played today
+    let candidateIndexes = pool.filter(idx => !todayPlayed.includes(songs[idx]?.id));
 
-    // If every song in this list was played today, reset cycle
-    if (freshPool.length === 0) {
-        freshPool = pool.slice();
+    // If every song in this pool has played today, reset queue to full pool
+    if (candidateIndexes.length === 0) {
+        candidateIndexes = pool.slice();
     }
 
-    // Keep unplayed queue synced
-    unplayedQueue = unplayedQueue.filter(idx => freshPool.includes(idx));
+    // Keep unplayedQueue clean
+    unplayedQueue = unplayedQueue.filter(idx => candidateIndexes.includes(idx));
 
     if (unplayedQueue.length === 0) {
-        unplayedQueue = freshPool.filter(idx => idx !== currentIndex);
-        if (unplayedQueue.length === 0) unplayedQueue = freshPool.slice();
+        unplayedQueue = candidateIndexes.filter(idx => idx !== currentIndex);
+        if (unplayedQueue.length === 0) unplayedQueue = candidateIndexes.slice();
 
-        // Randomize without immediate repeat
+        // Fisher-Yates Shuffle
         for (let i = unplayedQueue.length - 1; i > 0; i--) {
             const j = Math.floor(Math.random() * (i + 1));
             [unplayedQueue[i], unplayedQueue[j]] = [unplayedQueue[j], unplayedQueue[i]];
         }
     }
 
-    // Alternate artists in All mode
-    let pick = 0;
+    // In "All" mode, alternate between different music directors
+    let chosenPointer = 0;
     if (activeArtist === "all" && unplayedQueue.length > 1) {
-        const currentDir = songs[currentIndex] ? getSongArtist(songs[currentIndex]) : null;
-        const diffIdx = unplayedQueue.findIndex(idx => getSongArtist(songs[idx]) !== currentDir);
-        if (diffIdx !== -1) pick = diffIdx;
+        const currentDirector = songs[currentIndex] ? getSongArtist(songs[currentIndex]) : null;
+        const diffIndex = unplayedQueue.findIndex(idx => getSongArtist(songs[idx]) !== currentDirector);
+        if (diffIndex !== -1) chosenPointer = diffIndex;
     }
 
-    return unplayedQueue.splice(pick, 1)[0];
+    return unplayedQueue.splice(chosenPointer, 1)[0];
 }
 
 function formatTime(seconds) {
@@ -248,7 +237,7 @@ function formatTime(seconds) {
 }
 
 // ============================================================
-// UI UPDATES
+// PLAYER UI UPDATES
 // ============================================================
 
 function updatePlayerInformation(song) {
@@ -257,7 +246,7 @@ function updatePlayerInformation(song) {
 
     if (!song) {
         if (title) title.textContent = "No track playing";
-        if (artist) artist.textContent = "SELECT A SONG FROM YOUR LIBRARY";
+        if (artist) artist.textContent = "Select a song from your library";
         return;
     }
 
@@ -272,7 +261,7 @@ function updatePlayButton() {
 }
 
 // ============================================================
-// STUCK-FREE PLAYBACK ENGINE (NO DELAYS / NO FREEZES)
+// STUCK-FREE PLAYBACK ENGINE
 // ============================================================
 
 async function playSongAtIndex(index, isAuto = false) {
@@ -282,15 +271,20 @@ async function playSongAtIndex(index, isAuto = false) {
 
     const source = getSongSource(song);
     if (!source) {
-        console.warn("Unplayable track source, skipping:", song);
+        console.warn("Unplayable track source. Skipping:", song);
         if (isAuto) playNextAutomaticSong();
         return false;
     }
 
     const currentGen = ++playbackGeneration;
 
+    // Await active playback promise before resetting
+    if (activePlayPromise) {
+        try { await activePlayPromise; } catch (e) {}
+    }
+
+    // Decoder reset to prevent stalled audio buffers
     try {
-        // Halt and clear old buffer to prevent decoder deadlocks
         audio.pause();
         audio.removeAttribute("src");
         audio.load();
@@ -305,21 +299,22 @@ async function playSongAtIndex(index, isAuto = false) {
     markSongPlayedToday(song.id);
 
     try {
-        await audio.play();
+        activePlayPromise = audio.play();
+        await activePlayPromise;
+        activePlayPromise = null;
+
         if (currentGen === playbackGeneration) {
             updatePlayButton();
             updateMediaSession(song);
             return true;
         }
         return false;
-    } catch (err) {
-        console.warn("Playback error or interrupted:", err);
+    } catch (error) {
+        activePlayPromise = null;
+        console.warn("Playback error or aborted:", error);
         if (currentGen === playbackGeneration) {
             updatePlayButton();
-            // Automatically recover to next song without freezing
-            if (isAuto) {
-                setTimeout(playNextAutomaticSong, 100);
-            }
+            if (isAuto) playNextAutomaticSong();
         }
         return false;
     }
@@ -334,7 +329,7 @@ async function playNextAutomaticSong() {
         if (pool.length === 0) return;
 
         let attempts = 0;
-        const maxAttempts = Math.min(pool.length, 5);
+        const maxAttempts = Math.min(pool.length, 6);
 
         while (attempts < maxAttempts) {
             attempts++;
@@ -345,7 +340,7 @@ async function playNextAutomaticSong() {
             if (success) return;
         }
 
-        // Direct sequential index fallback
+        // Sequential fallback
         const nextPos = (currentIndex + 1) % songs.length;
         await playSongAtIndex(nextPos, true);
     } finally {
@@ -387,7 +382,7 @@ async function prevSong() {
 }
 
 // ============================================================
-// EDIT METADATA MODAL / PROMPT
+// EDIT SONG MODAL / PROMPT
 // ============================================================
 
 async function editSong(index) {
@@ -418,7 +413,7 @@ async function editSong(index) {
 }
 
 // ============================================================
-// MEDIA CONTROLS & AIRPODS
+// MEDIA SESSION (AIRPODS & LOCKSCREEN)
 // ============================================================
 
 function updateMediaSession(song) {
@@ -459,19 +454,19 @@ function setupMediaSession() {
     navigator.mediaSession.setActionHandler("previoustrack", () => prevSong());
 
     try {
-        navigator.mediaSession.setActionHandler("seekforward", (d) => {
-            const skip = d.seekOffset || 10;
+        navigator.mediaSession.setActionHandler("seekforward", (details) => {
+            const skip = details.seekOffset || 10;
             audio.currentTime = Math.min(audio.duration || 0, audio.currentTime + skip);
             updateMediaPosition();
         });
-        navigator.mediaSession.setActionHandler("seekbackward", (d) => {
-            const skip = d.seekOffset || 10;
+        navigator.mediaSession.setActionHandler("seekbackward", (details) => {
+            const skip = details.seekOffset || 10;
             audio.currentTime = Math.max(0, audio.currentTime - skip);
             updateMediaPosition();
         });
-        navigator.mediaSession.setActionHandler("seekto", (d) => {
-            if (d.seekTime !== undefined && Number.isFinite(d.seekTime)) {
-                audio.currentTime = d.seekTime;
+        navigator.mediaSession.setActionHandler("seekto", (details) => {
+            if (details.seekTime !== undefined && Number.isFinite(details.seekTime)) {
+                audio.currentTime = details.seekTime;
                 updateMediaPosition();
             }
         });
@@ -479,7 +474,7 @@ function setupMediaSession() {
 }
 
 // ============================================================
-// ARTIST FILTERS & COUNTERS
+// ARTIST FILTER
 // ============================================================
 
 function getArtists() {
@@ -521,7 +516,7 @@ function updateSongCount() {
 }
 
 // ============================================================
-// RENDER LIBRARY (GLOSSY BUTTONS & INLINE EDIT)
+// RENDER SONG LIST WITH ATTRACTIVE PLAY & EDIT BUTTONS
 // ============================================================
 
 function renderSongList() {
@@ -536,7 +531,7 @@ function renderSongList() {
         empty.className = "empty-library";
         empty.style.padding = "24px";
         empty.style.textAlign = "center";
-        empty.style.color = "rgba(255,255,255,0.4)";
+        empty.style.color = "rgba(255,255,255,0.5)";
         empty.textContent = songs.length === 0 ? "No songs uploaded yet" : "No songs found";
         container.appendChild(empty);
         return;
@@ -553,6 +548,7 @@ function renderSongList() {
         const card = document.createElement("div");
         card.className = "song-card" + (isCurrent ? " active" : "");
 
+        // Song Information
         const info = document.createElement("div");
         info.className = "song-info";
 
@@ -574,14 +570,14 @@ function renderSongList() {
         info.appendChild(icon);
         info.appendChild(meta);
 
-        // Action Buttons Row
+        // Action Buttons Container
         const actions = document.createElement("div");
         actions.className = "song-actions";
         actions.style.display = "flex";
         actions.style.alignItems = "center";
         actions.style.gap = "8px";
 
-        // Stylish Edit Button
+        // Attractive Edit Button
         const editBtn = document.createElement("button");
         editBtn.type = "button";
         editBtn.className = "btn-edit-action";
@@ -590,26 +586,27 @@ function renderSongList() {
         editBtn.style.fontSize = "0.72rem";
         editBtn.style.fontWeight = "700";
         editBtn.style.color = "#70e1ff";
-        editBtn.style.background = "rgba(0, 180, 216, 0.15)";
-        editBtn.style.border = "1px solid rgba(0, 210, 255, 0.4)";
+        editBtn.style.background = "rgba(0, 180, 216, 0.12)";
+        editBtn.style.border = "1px solid rgba(0, 210, 255, 0.35)";
         editBtn.style.borderRadius = "12px";
         editBtn.style.cursor = "pointer";
+        editBtn.style.backdropFilter = "blur(8px)";
         editBtn.onclick = (e) => {
             e.stopPropagation();
             editSong(index);
         };
 
-        // Attractive Glossy Play Button
+        // Attractive Play/Pause Button
         const playButton = document.createElement("button");
         playButton.type = "button";
         playButton.className = "play-mini";
-        playButton.style.width = "38px";
-        playButton.style.height = "38px";
+        playButton.style.width = "36px";
+        playButton.style.height = "36px";
         playButton.style.borderRadius = "50%";
         playButton.style.display = "flex";
         playButton.style.alignItems = "center";
         playButton.style.justifyContent = "center";
-        playButton.style.border = "1px solid rgba(255, 255, 255, 0.6)";
+        playButton.style.border = "1px solid rgba(255, 255, 255, 0.5)";
         playButton.style.borderTop = "1px solid #ffffff";
         playButton.style.background = isPlaying
             ? "linear-gradient(145deg, #00f0ff, #0077b6)"
@@ -633,20 +630,20 @@ function renderSongList() {
 
         card.appendChild(info);
         card.appendChild(actions);
-        card.onclick = () => playSongAtIndex(index, false);
 
+        card.onclick = () => playSongAtIndex(index, false);
         container.appendChild(card);
     });
 }
 
 // ============================================================
-// IMPORT FILES
+// IMPORT SONGS
 // ============================================================
 
 async function importSongs(files) {
     if (!files || files.length === 0) return;
     if (!db) {
-        alert("Library loading. Please wait 1 second and try again.");
+        alert("Music library is still loading. Please try again.");
         return;
     }
 
@@ -670,7 +667,7 @@ async function importSongs(files) {
             track.id = id;
             songs.push(track);
         } catch (e) {
-            console.error("Save failed:", file.name, e);
+            console.error("Save error:", file.name, e);
         }
     }
 
@@ -685,7 +682,7 @@ async function importSongs(files) {
 }
 
 // ============================================================
-// ATTACH CORE AUDIO EVENTS (GUARANTEED CONTINUOUS PLAY)
+// AUDIO EVENTS
 // ============================================================
 
 audio.addEventListener("play", () => {
@@ -704,16 +701,15 @@ audio.addEventListener("pause", () => {
     }
 });
 
-// Trigger next track the instant the current one finishes
 audio.addEventListener("ended", () => {
+    // Automatically advance to the next song without stuck cycles
     playNextAutomaticSong();
 });
 
-// Auto-skip corrupt tracks instead of freezing the player
 audio.addEventListener("error", (e) => {
-    console.warn("Audio element encountered an error. Auto-advancing:", e);
+    console.error("Audio error encountered:", e);
     updatePlayButton();
-    setTimeout(playNextAutomaticSong, 150);
+    playNextAutomaticSong();
 });
 
 audio.addEventListener("loadedmetadata", () => {
@@ -734,7 +730,7 @@ audio.addEventListener("timeupdate", () => {
 });
 
 // ============================================================
-// EVENT CONTROLS BINDING
+// CONTROL SETUP
 // ============================================================
 
 function setupControls() {
@@ -772,10 +768,27 @@ function setupControls() {
             }
         });
     }
+
+    const muteBtn = document.getElementById("muteBtn");
+    if (muteBtn) {
+        muteBtn.addEventListener("click", () => {
+            audio.muted = !audio.muted;
+            muteBtn.textContent = audio.muted ? "🔇" : "🔊";
+        });
+    }
+
+    const volumeBar = document.getElementById("volumeBar");
+    if (volumeBar) {
+        audio.volume = Number(volumeBar.value);
+        volumeBar.addEventListener("input", () => {
+            audio.volume = Number(volumeBar.value);
+            audio.muted = audio.volume === 0;
+        });
+    }
 }
 
 // ============================================================
-// BOOTLOADER
+// INITIALIZE
 // ============================================================
 
 async function initializeApp() {
@@ -799,6 +812,12 @@ document.addEventListener("DOMContentLoaded", async () => {
     setupControls();
     await initializeApp();
 });
+
+if ("serviceWorker" in navigator) {
+    window.addEventListener("load", () => {
+        navigator.serviceWorker.register("./sw.js").catch(() => {});
+    });
+}
 
 window.addEventListener("beforeunload", () => {
     if (audio) audio.pause();
